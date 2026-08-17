@@ -4,7 +4,7 @@ Async library for the HomeWizard Cloud API: authentication, P1 device
 discovery and two WebSocket streams (state + realtime wattage).
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from .client import HomeWizardCloudClient, apply_patch
 from .exceptions import APIError, AuthenticationError, HomeWizardCloudError

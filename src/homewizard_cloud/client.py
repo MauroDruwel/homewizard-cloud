@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 StateCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 RealtimeCallback = Callable[[RealtimeMeasurement], Awaitable[None] | None]
+ConnectionCallback = Callable[[bool], Awaitable[None] | None]
 
 
 class HomeWizardCloudClient:
@@ -140,6 +141,7 @@ class HomeWizardCloudClient:
         device_id: str,
         on_state: StateCallback | None = None,
         on_realtime: RealtimeCallback | None = None,
+        on_connection: ConnectionCallback | None = None,
         *,
         three_phases: bool = False,
     ) -> None:
@@ -148,10 +150,13 @@ class HomeWizardCloudClient:
         Runs the main state WebSocket (hello -> subscribe_device) and the
         realtime wattage WebSocket in parallel. Both reconnect
         automatically; the access token is refreshed when rejected.
+
+        ``on_connection`` is called with ``True`` when the main stream is
+        connected and subscribed, and ``False`` when it disconnects.
         """
         self._stop_event.clear()
         tasks = [
-            asyncio.create_task(self._run_main_stream(device_id, on_state)),
+            asyncio.create_task(self._run_main_stream(device_id, on_state, on_connection)),
             asyncio.create_task(self._run_realtime_stream(device_id, on_realtime, three_phases)),
         ]
         self._tasks.update(tasks)
@@ -172,8 +177,10 @@ class HomeWizardCloudClient:
         self,
         device_id: str,
         on_state: StateCallback | None,
+        on_connection: ConnectionCallback | None = None,
     ) -> None:
         state: dict[str, Any] = {}
+        connected = False
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(MAIN_WS_URL) as ws:
@@ -183,7 +190,11 @@ class HomeWizardCloudClient:
                         await self._handle_auth_rejection(ws, device_id)
                         continue
                     await self._send(ws, {"type": "subscribe_device", "device": device_id})
-                    logger.info("Subscribed to device %s (main stream)", device_id)
+                    if not connected:
+                        connected = True
+                        logger.info("Subscribed to device %s (main stream)", device_id)
+                        if on_connection is not None:
+                            await self._maybe_await(on_connection(True))
 
                     async for raw in ws:
                         message = json.loads(raw)
@@ -203,6 +214,10 @@ class HomeWizardCloudClient:
                             if on_state is not None:
                                 await self._maybe_await(on_state(device_id, state))
             except (websockets.ConnectionClosed, OSError, asyncio.CancelledError):
+                if connected:
+                    connected = False
+                    if on_connection is not None:
+                        await self._maybe_await(on_connection(False))
                 if self._stop_event.is_set():
                     break
                 logger.info(
@@ -211,6 +226,10 @@ class HomeWizardCloudClient:
                 )
                 await self._sleep_or_stop(self.reconnect_delay)
             except Exception:
+                if connected:
+                    connected = False
+                    if on_connection is not None:
+                        await self._maybe_await(on_connection(False))
                 logger.exception("Main stream error")
                 await self._sleep_or_stop(self.reconnect_delay)
 
