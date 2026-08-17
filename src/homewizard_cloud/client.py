@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -27,6 +28,7 @@ from .constants import (
     MAIN_WS_URL,
     REALTIME_WS_URL,
     REQUEST_TIMEOUT,
+    TOKEN_LIFETIME,
     TOKEN_RENEW_MARGIN,
 )
 from .exceptions import APIError
@@ -57,7 +59,8 @@ class HomeWizardCloudClient:
 
         self.access_token: str | None = None
         self._token_fetched_at: float = 0.0
-        self._token_ttl: float = 0.0
+        self._token_ttl: float = TOKEN_LIFETIME
+        self._auth_lock = asyncio.Lock()
 
         self._message_id = 0
         self._stop_event = asyncio.Event()
@@ -67,10 +70,11 @@ class HomeWizardCloudClient:
 
     async def authenticate(self) -> str:
         """Fetch (or refresh) the access token."""
-        token = await asyncio.to_thread(auth.get_access_token, self.email, self.password)
-        self.access_token = token
-        self._token_fetched_at = asyncio.get_running_loop().time()
-        return token
+        async with self._auth_lock:
+            token = await asyncio.to_thread(auth.get_access_token, self.email, self.password)
+            self.access_token = token
+            self._token_fetched_at = asyncio.get_running_loop().time()
+            return token
 
     def _token_is_valid(self) -> bool:
         if not self.access_token:
@@ -142,6 +146,7 @@ class HomeWizardCloudClient:
         on_state: StateCallback | None = None,
         on_realtime: RealtimeCallback | None = None,
         on_connection: ConnectionCallback | None = None,
+        on_realtime_connection: ConnectionCallback | None = None,
         *,
         three_phases: bool = False,
     ) -> None:
@@ -153,11 +158,20 @@ class HomeWizardCloudClient:
 
         ``on_connection`` is called with ``True`` when the main stream is
         connected and subscribed, and ``False`` when it disconnects.
+        ``on_realtime_connection`` reports the connection state of the
+        second-by-second wattage stream.
         """
         self._stop_event.clear()
         tasks = [
             asyncio.create_task(self._run_main_stream(device_id, on_state, on_connection)),
-            asyncio.create_task(self._run_realtime_stream(device_id, on_realtime, three_phases)),
+            asyncio.create_task(
+                self._run_realtime_stream(
+                    device_id,
+                    on_realtime,
+                    three_phases,
+                    on_realtime_connection,
+                )
+            ),
         ]
         self._tasks.update(tasks)
         try:
@@ -181,6 +195,15 @@ class HomeWizardCloudClient:
     ) -> None:
         state: dict[str, Any] = {}
         connected = False
+
+        async def set_connection(value: bool) -> None:
+            nonlocal connected
+            if connected == value:
+                return
+            connected = value
+            if on_connection is not None:
+                await self._maybe_await(on_connection(value))
+
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(MAIN_WS_URL) as ws:
@@ -188,21 +211,25 @@ class HomeWizardCloudClient:
                     authenticated = await self._await_hello_response(ws)
                     if not authenticated:
                         await self._handle_auth_rejection(ws, device_id)
+                        await self._sleep_or_stop(self.reconnect_delay)
                         continue
                     await self._send(ws, {"type": "subscribe_device", "device": device_id})
-                    if not connected:
-                        connected = True
-                        logger.info("Subscribed to device %s (main stream)", device_id)
-                        if on_connection is not None:
-                            await self._maybe_await(on_connection(True))
+                    await set_connection(True)
+                    logger.info("Subscribed to device %s (main stream)", device_id)
 
                     async for raw in ws:
                         message = json.loads(raw)
                         msg_type = message.get("type")
 
+                        if msg_type == "response" and message.get("status") in (401, 403):
+                            logger.warning("Main stream subscription rejected: %s", message)
+                            await set_connection(False)
+                            await ws.close()
+                            break
                         if msg_type == "error":
                             logger.warning("Main stream error: %s", message)
                             if "Authentication" in str(message.get("message", "")):
+                                await set_connection(False)
                                 await self._handle_auth_rejection(ws, device_id)
                                 break
                         elif msg_type in ("p1dongle", "energysocket", "watermeter"):
@@ -213,11 +240,14 @@ class HomeWizardCloudClient:
                             apply_patch(state, message.get("patch", []))
                             if on_state is not None:
                                 await self._maybe_await(on_state(device_id, state))
-            except (websockets.ConnectionClosed, OSError, asyncio.CancelledError):
-                if connected:
-                    connected = False
-                    if on_connection is not None:
-                        await self._maybe_await(on_connection(False))
+                    await set_connection(False)
+                if not self._stop_event.is_set():
+                    await self._sleep_or_stop(self.reconnect_delay)
+            except asyncio.CancelledError:
+                await set_connection(False)
+                raise
+            except (websockets.ConnectionClosed, OSError):
+                await set_connection(False)
                 if self._stop_event.is_set():
                     break
                 logger.info(
@@ -226,10 +256,7 @@ class HomeWizardCloudClient:
                 )
                 await self._sleep_or_stop(self.reconnect_delay)
             except Exception:
-                if connected:
-                    connected = False
-                    if on_connection is not None:
-                        await self._maybe_await(on_connection(False))
+                await set_connection(False)
                 logger.exception("Main stream error")
                 await self._sleep_or_stop(self.reconnect_delay)
 
@@ -238,9 +265,20 @@ class HomeWizardCloudClient:
         device_id: str,
         on_realtime: RealtimeCallback | None,
         three_phases: bool,
+        on_connection: ConnectionCallback | None = None,
     ) -> None:
-        if on_realtime is None:
+        if on_realtime is None and on_connection is None:
             return
+        connected = False
+
+        async def set_connection(value: bool) -> None:
+            nonlocal connected
+            if connected == value:
+                return
+            connected = value
+            if on_connection is not None:
+                await self._maybe_await(on_connection(value))
+
         while not self._stop_event.is_set():
             try:
                 token = await self._ensure_token()
@@ -260,18 +298,26 @@ class HomeWizardCloudClient:
                             }
                         )
                     )
+                    await set_connection(True)
                     logger.info("Subscribed to device %s (realtime stream)", device_id)
 
                     async for raw in ws:
                         message = json.loads(raw)
-                        if "time" in message and "wattage" in message:
+                        if on_realtime is not None and "time" in message and "wattage" in message:
                             measurement = RealtimeMeasurement(
                                 timestamp=message.get("time"),
                                 wattage=message.get("wattage"),
                                 wattages=message.get("wattages"),
                             )
                             await self._maybe_await(on_realtime(measurement))
-            except (websockets.ConnectionClosed, OSError, asyncio.CancelledError):
+                    await set_connection(False)
+                if not self._stop_event.is_set():
+                    await self._sleep_or_stop(self.reconnect_delay)
+            except asyncio.CancelledError:
+                await set_connection(False)
+                raise
+            except (websockets.ConnectionClosed, OSError):
+                await set_connection(False)
                 if self._stop_event.is_set():
                     break
                 logger.info(
@@ -280,6 +326,7 @@ class HomeWizardCloudClient:
                 )
                 await self._sleep_or_stop(self.reconnect_delay)
             except Exception:
+                await set_connection(False)
                 logger.exception("Realtime stream error")
                 await self._sleep_or_stop(self.reconnect_delay)
 
@@ -324,13 +371,12 @@ class HomeWizardCloudClient:
 
     @staticmethod
     async def _maybe_await(result) -> None:
-        if asyncio.iscoroutine(result):
+        if inspect.isawaitable(result):
             await result
 
-
-async def _sleep_or_stop(self, delay: float) -> None:
-    with contextlib.suppress(asyncio.TimeoutError):
-        await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+    async def _sleep_or_stop(self, delay: float) -> None:
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
 
 
 def apply_patch(state: dict[str, Any], patch: list) -> None:
