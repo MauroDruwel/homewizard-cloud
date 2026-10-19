@@ -12,6 +12,7 @@ import contextlib
 import inspect
 import json
 import logging
+import ssl
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -31,16 +32,23 @@ from .constants import (
     TOKEN_LIFETIME,
     TOKEN_RENEW_MARGIN,
 )
-from .exceptions import APIError
+from .exceptions import APIError, AuthenticationError
 from .models import Location, P1Device, RealtimeMeasurement
 
-__all__ = ["HomeWizardCloudClient"]
+__all__ = [
+    "AuthFailedCallback",
+    "ConnectionCallback",
+    "HomeWizardCloudClient",
+    "RealtimeCallback",
+    "StateCallback",
+]
 
 logger = logging.getLogger(__name__)
 
 StateCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 RealtimeCallback = Callable[[RealtimeMeasurement], Awaitable[None] | None]
 ConnectionCallback = Callable[[bool], Awaitable[None] | None]
+AuthFailedCallback = Callable[[], Awaitable[None] | None]
 
 
 class HomeWizardCloudClient:
@@ -52,10 +60,12 @@ class HomeWizardCloudClient:
         password: str,
         *,
         reconnect_delay: float = 5.0,
+        ssl: ssl.SSLContext | None = None,
     ) -> None:
         self.email = email
         self.password = password
         self.reconnect_delay = reconnect_delay
+        self.ssl = ssl
 
         self.access_token: str | None = None
         self._token_fetched_at: float = 0.0
@@ -147,6 +157,7 @@ class HomeWizardCloudClient:
         on_realtime: RealtimeCallback | None = None,
         on_connection: ConnectionCallback | None = None,
         on_realtime_connection: ConnectionCallback | None = None,
+        on_auth_failed: AuthFailedCallback | None = None,
         *,
         three_phases: bool = False,
     ) -> None:
@@ -160,16 +171,21 @@ class HomeWizardCloudClient:
         connected and subscribed, and ``False`` when it disconnects.
         ``on_realtime_connection`` reports the connection state of the
         second-by-second wattage stream.
+        ``on_auth_failed`` is called when authentication fails or credentials
+        are rejected, before raising AuthenticationError.
         """
         self._stop_event.clear()
         tasks = [
-            asyncio.create_task(self._run_main_stream(device_id, on_state, on_connection)),
+            asyncio.create_task(
+                self._run_main_stream(device_id, on_state, on_connection, on_auth_failed)
+            ),
             asyncio.create_task(
                 self._run_realtime_stream(
                     device_id,
                     on_realtime,
                     three_phases,
                     on_realtime_connection,
+                    on_auth_failed,
                 )
             ),
         ]
@@ -192,6 +208,7 @@ class HomeWizardCloudClient:
         device_id: str,
         on_state: StateCallback | None,
         on_connection: ConnectionCallback | None = None,
+        on_auth_failed: AuthFailedCallback | None = None,
     ) -> None:
         state: dict[str, Any] = {}
         connected = False
@@ -204,9 +221,13 @@ class HomeWizardCloudClient:
             if on_connection is not None:
                 await self._maybe_await(on_connection(value))
 
+        connect_kwargs: dict[str, Any] = {}
+        if self.ssl is not None:
+            connect_kwargs["ssl"] = self.ssl
+
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(MAIN_WS_URL) as ws:
+                async with websockets.connect(MAIN_WS_URL, **connect_kwargs) as ws:
                     await self._hello(ws)
                     authenticated = await self._await_hello_response(ws)
                     if not authenticated:
@@ -246,6 +267,14 @@ class HomeWizardCloudClient:
             except asyncio.CancelledError:
                 await set_connection(False)
                 raise
+            except AuthenticationError as exc:
+                await set_connection(False)
+                logger.error("Authentication failed in main stream: %s", exc)
+                if on_auth_failed is not None:
+                    with contextlib.suppress(Exception):
+                        await self._maybe_await(on_auth_failed())
+                self.close()
+                raise
             except (websockets.ConnectionClosed, OSError):
                 await set_connection(False)
                 if self._stop_event.is_set():
@@ -266,6 +295,7 @@ class HomeWizardCloudClient:
         on_realtime: RealtimeCallback | None,
         three_phases: bool,
         on_connection: ConnectionCallback | None = None,
+        on_auth_failed: AuthFailedCallback | None = None,
     ) -> None:
         if on_realtime is None and on_connection is None:
             return
@@ -279,10 +309,14 @@ class HomeWizardCloudClient:
             if on_connection is not None:
                 await self._maybe_await(on_connection(value))
 
+        connect_kwargs: dict[str, Any] = {}
+        if self.ssl is not None:
+            connect_kwargs["ssl"] = self.ssl
+
         while not self._stop_event.is_set():
             try:
                 token = await self._ensure_token()
-                async with websockets.connect(REALTIME_WS_URL) as ws:
+                async with websockets.connect(REALTIME_WS_URL, **connect_kwargs) as ws:
                     await ws.send(
                         json.dumps(
                             {
@@ -315,6 +349,14 @@ class HomeWizardCloudClient:
                     await self._sleep_or_stop(self.reconnect_delay)
             except asyncio.CancelledError:
                 await set_connection(False)
+                raise
+            except AuthenticationError as exc:
+                await set_connection(False)
+                logger.error("Authentication failed in realtime stream: %s", exc)
+                if on_auth_failed is not None:
+                    with contextlib.suppress(Exception):
+                        await self._maybe_await(on_auth_failed())
+                self.close()
                 raise
             except (websockets.ConnectionClosed, OSError):
                 await set_connection(False)

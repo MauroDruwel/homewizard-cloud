@@ -26,3 +26,40 @@ def test_token_is_renewed_before_expiry() -> None:
         assert not client._token_is_valid()
 
     asyncio.run(_check())
+
+
+def test_client_accepts_ssl_context() -> None:
+    import ssl
+
+    context = ssl.create_default_context()
+    client = HomeWizardCloudClient("user@example.com", "password", ssl=context)
+    assert client.ssl is context
+
+
+def test_auth_failure_triggers_callback_and_raises() -> None:
+    from unittest.mock import AsyncMock, patch
+
+    from homewizard_cloud.exceptions import AuthenticationError
+
+    async def _check() -> None:
+        client = HomeWizardCloudClient("user@example.com", "password")
+        auth_failed_mock = AsyncMock()
+
+        with patch.object(
+            client,
+            "_ensure_token",
+            side_effect=AuthenticationError("Invalid credentials"),
+        ):
+            try:
+                await client.listen(
+                    "p1_test",
+                    on_auth_failed=auth_failed_mock,
+                )
+            except AuthenticationError:
+                pass
+            else:
+                assert False, "Expected AuthenticationError was not raised"
+
+            assert auth_failed_mock.called
+
+    asyncio.run(_check())

@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-10-19
+
+### Fixed
+- WebSockets now accept an optional `ssl` context (`ssl.SSLContext`) to prevent blocking `SSLContext.load_default_certs` calls in async event loops (e.g. in Home Assistant).
+- Surfaced authentication failures via `on_auth_failed` callback and raised `AuthenticationError` out of `listen()` instead of infinitely retrying when credentials or tokens are invalid.
+
 ## [1.0.2] - 2026-08-17
 
 ### Fixed
